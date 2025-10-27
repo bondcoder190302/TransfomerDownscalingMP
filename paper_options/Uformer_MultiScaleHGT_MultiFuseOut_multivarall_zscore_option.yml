@@ -1,0 +1,134 @@
+# ==========================================
+#  Transformer Downscaling for Precipitation
+#  (ERA5-Land → CHIRPS, Madhya Pradesh)
+#  Author: Adapted by Vipul Tiwari (2025)
+# ==========================================
+
+# -----------------------
+# General settings
+# -----------------------
+name: Uformer_Precipitation_MultiScaleHGT_MultiFuseOut_ep120_lr1e4_c128_B4G8
+model_type: ClimateUformerMultiscaleFuseModel
+scale: 2                   # 0.1° to 0.05° resolution
+num_gpu: 1                 # change to 0 for CPU mode
+manual_seed: 42
+fp16: false
+
+# -----------------------
+# Dataset and data loader
+# -----------------------
+datasets:
+  common:
+    name: Precipitation
+    type: MergeDataset
+    dirName_stat: ./DownScale_Paper/param_stat_12_36/
+    dirName_data: ./DownScale_Paper/
+    listofVar: [Precip_cut]             # low-res ERA5-Land input
+    varName_gt: [Precip_cut_obs]        # high-res CHIRPS target
+    hgt_obs: HGT_fix_cut_obs            # static SRTM elevation
+    radar_file: ./DownScale_Paper/DownScale_Correction_split/data.txt
+    index_gt: [0]
+    normalize: 'log1p'                  # we already used log1p normalization
+    seq_length: 1
+    seq_interval: 1
+
+  train:
+    train_file: ./DownScale_Paper/DownScale_Correction_split/train_12_36.txt
+    use_shuffle: true
+    num_worker_per_gpu: 2
+    batch_size_per_gpu: 4
+    dataset_enlarge_ratio: 1
+    randomcrop: false
+    gt_size: 128                        # your HR patch size
+    prefetch_mode: ~
+
+  val:
+    train_file: ./DownScale_Paper/DownScale_Correction_split/val_12_36.txt
+
+  test_1:
+    train_file: ./DownScale_Paper/DownScale_Correction_split/test_12_36.txt
+
+# -----------------------
+# Network structure
+# -----------------------
+network_g:
+  type: ClimateUformerMultiScaleHGTMultiScaleOut
+  add_hgt: true
+  upscale: 2
+  num_in_ch: 1          # single variable: precipitation
+  num_out_ch: 1         # predict precipitation only
+  img_size: 64
+  window_size: 8
+  depths: [2, 2, 2, 2, 2]
+  embed_dim: 128
+  num_heads: [4, 8, 16, 16, 8]
+  mlp_ratio: 4
+  token_projection: 'linear'
+  token_mlp: 'leff'
+  activation: none
+  multi_add_pos: 'xcoder'
+
+# -----------------------
+# Paths
+# -----------------------
+path:
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+
+# -----------------------
+# Training settings
+# -----------------------
+train:
+  optim_g:
+    type: Adam
+    lr: !!float 1e-4
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: MultiStepLR
+    milestones: [3000, 6000, 9000]
+    gamma: 0.5
+
+  total_iter: 12000           # adjust based on data size (120 epochs baseline)
+  warmup_iter: -1
+
+  pixel_opt:
+    type: CharbonnierLoss      # or L1Loss for simplicity
+    loss_weight: 10
+    reduction: mean
+
+# -----------------------
+# Validation settings
+# -----------------------
+val:
+  val_freq: 500
+  save_img: false
+  save_npy: true
+  save_npy_onlyoutput: true
+  pbar: true
+
+  metrics:
+    mse:
+      type: calculate_climate_mse
+      crop_border: 10
+      better: lower
+    mae:
+      type: calculate_climate_mae
+      crop_border: 10
+      better: lower
+
+# -----------------------
+# Logging settings
+# -----------------------
+logger:
+  print_freq: 10
+  save_checkpoint_freq: 2000
+  use_tb_logger: true
+
+# -----------------------
+# Distributed training
+# -----------------------
+dist_params:
+  backend: nccl
+  port: 29500
