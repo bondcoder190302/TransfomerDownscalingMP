@@ -5,125 +5,150 @@ import math
 from tqdm import tqdm
 from collections import OrderedDict
 import torch.nn.functional as F
-from .climatesr_model import ClimateSRModel, ClimateSRAddHGTModel
+from .climatesr_model import ClimateSRAddHGTModel
 from basicsr.utils.registry import MODEL_REGISTRY
-from basicsr.metrics import calculate_metric
-from Plot.pcolor_map_one import pcolor_map_one_python as pcolor_map_one
-from basicsr.utils.dist_util import get_dist_info
 from torch import distributed as dist
 
-def expand2square(timg, factor=16.0):
-    h, w = timg.shape[-2:]
-    rsp = timg.shape[:-2]
 
-    X = int(math.ceil(max(h,w)/float(factor))*factor)
-
-    img = torch.zeros(*rsp,X,X).type_as(timg) # 3, h,w
-    mask = torch.zeros(rsp[0],1,X,X).type_as(timg)
-
-    # print(img.size(),mask.size())
-    # print((X - h)//2, (X - h)//2+h, (X - w)//2, (X - w)//2+w)
-    img[..., ((X - h)//2):((X - h)//2 + h),((X - w)//2):((X - w)//2 + w)] = timg
-    mask[..., ((X - h)//2):((X - h)//2 + h),((X - w)//2):((X - w)//2 + w)].fill_(1.0)
-
-    return img, mask
-
+# =====================================================
+# Utility: pad image to nearest multiple of window size
+# =====================================================
 def expand2square2(timg, factor=16.0):
+    """Pad tensor (4D or 5D) to be divisible by given factor using reflection padding."""
     h, w = timg.shape[-2:]
     rsp = timg.shape[:-2]
-
-    X = int(math.ceil(max(h,w)/float(factor))*factor)
+    X = int(math.ceil(max(h, w) / float(factor)) * factor)
     mod_pad_w = X - w
     mod_pad_h = X - h
     if timg.ndim == 5:
-        img = F.pad(timg, (0, mod_pad_w, 0, mod_pad_h, 0, 0), 'reflect')
+        img = F.pad(timg, (0, mod_pad_w, 0, mod_pad_h, 0, 0), mode='reflect')
     elif timg.ndim == 4:
-        img = F.pad(timg, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
-    # print(img.size(),mask.size())
-    # print((X - h)//2, (X - h)//2+h, (X - w)//2, (X - w)//2+w)
-    mask = torch.zeros(rsp[0],1,X,X).type_as(timg)
-    mask[..., :h,:w].fill_(1.0)
-
+        img = F.pad(timg, (0, mod_pad_w, 0, mod_pad_h), mode='reflect')
+    else:
+        raise ValueError(f"Unexpected tensor ndim: {timg.ndim}")
+    mask = torch.zeros(rsp[0], 1, X, X, device=timg.device, dtype=timg.dtype)
+    mask[..., :h, :w] = 1.0
     return img, mask
 
+
+# =====================================================
+# Uformer Model - Single Variable Precipitation version
+# =====================================================
 @MODEL_REGISTRY.register()
 class ClimateUformerModel(ClimateSRAddHGTModel):
+    """Simplified single-scale Climate Uformer (used for baseline precipitation version)."""
+
     def test(self):
-        # pad to multiplication of window_size
         window_size = self.opt['network_g']['window_size']
-        scale = self.opt.get('scale')
+        scale = self.opt.get('scale', 2)
+
+        # prepare low-res input
         h, w = self.lq['lq'].shape[-2:]
         self.lq['lq'], mask = expand2square2(self.lq['lq'], factor=window_size * 4)
         if h == w and h % (window_size * 4) == 0:
             mask = None
-        if self.lq['hgt'].shape[-1]:
+
+        # prepare high-res auxiliary (elevation)
+        if 'hgt' in self.lq and self.lq['hgt'].numel() > 0:
             self.lq['hgt'], _ = expand2square2(self.lq['hgt'], factor=window_size * 4 * scale)
-        if hasattr(self, 'net_g_ema'):
-            self.net_g_ema.eval()
-            with torch.no_grad():
-                self.output = self.net_g_ema(self.lq, mask)
-        else:
-            self.net_g.eval()
-            with torch.no_grad():
-                self.output = self.net_g(self.lq, None)
-            self.net_g.train()
 
-        self.output = self.output[..., :h*scale, :w*scale]
+        net = self.net_g_ema if hasattr(self, 'net_g_ema') else self.net_g
+        net.eval()
+        with torch.no_grad():
+            self.output = net(self.lq, mask if hasattr(self, 'net_g_ema') else None)
+        self.output = self.output[..., :h * scale, :w * scale]
+        net.train()
 
+
+# =====================================================
+# Multi-Scale Fusion version (Main training model)
+# =====================================================
 @MODEL_REGISTRY.register()
 class ClimateUformerMultiscaleFuseModel(ClimateSRAddHGTModel):
-    def test(self):        # pad to multiplication of window_size
+    """
+    Modified version for precipitation downscaling with elevation as auxiliary input.
+    Only one input (precip) and one output channel.
+    """
+
+    def test(self):
+        """Inference: pad to multiples of window size, apply model, crop back."""
         window_size = self.opt['network_g']['window_size']
-        scale = self.opt.get('scale')
+        scale = self.opt.get('scale', 2)
+
         h, w = self.lq['lq'].shape[-2:]
         self.lq['lq'], mask = expand2square2(self.lq['lq'], factor=window_size * 4)
         if h == w and h % (window_size * 4) == 0:
             mask = None
-        if self.lq['hgt'].shape[-1]:
+
+        # elevation (optional)
+        if 'hgt' in self.lq and self.lq['hgt'].numel() > 0:
             self.lq['hgt'], _ = expand2square2(self.lq['hgt'], factor=window_size * 4 * scale)
-        if hasattr(self, 'net_g_ema'):
-            self.net_g_ema.eval()
-            with torch.no_grad():
-                self.output = self.net_g_ema(self.lq, mask)
-        else:
-            self.net_g.eval()
-            with torch.no_grad():
-                self.output = self.net_g(self.lq, None)
-            self.net_g.train()
 
-        self.output = self.output[0][..., :h*scale, :w*scale]
+        net = self.net_g_ema if hasattr(self, 'net_g_ema') else self.net_g
+        net.eval()
+        with torch.no_grad():
+            self.output = net(self.lq, mask if hasattr(self, 'net_g_ema') else None)
 
+        # first element in output list is main HR prediction
+        if isinstance(self.output, (list, tuple)):
+            self.output = self.output[0]
+
+        self.output = self.output[..., :h * scale, :w * scale]
+        net.train()
+
+    # =====================================================
+    # Training Step
+    # =====================================================
     def optimize_parameters(self, current_iter):
-        self.optimizer_g.zero_grad()
+        """Forward + loss + backward for precipitation regression."""
+        self.optimizer_g.zero_grad(set_to_none=True)
+
+        # Forward pass (with AMP support)
         with torch.cuda.amp.autocast(enabled=self.amp_training):
             self.output = self.net_g(self.lq)
-        self.output = [v.float() for v in self.output]
-        l_total = 0
+        if isinstance(self.output, (list, tuple)):
+            self.output = [v.float() for v in self.output]
+        else:
+            self.output = [self.output.float()]
+
+        l_total = 0.0
         loss_dict = OrderedDict()
-        # pixel loss
-        scale = self.opt.get('scale')
+        scale = self.opt.get('scale', 2)
+
+        # --------------------
+        # 1) Main pixel loss
+        # --------------------
         if self.cri_pix:
             l_pix = self.cri_pix(self.output[0], self.gt)
             l_total += l_pix
             loss_dict['l_pix'] = l_pix
-        if self.cri_pix_multiscale:
-            gt0 = F.interpolate(self.gt, scale_factor=1/(scale*4), mode='bilinear', align_corners=False)
-            gt1 = F.interpolate(self.gt, scale_factor=1/(scale*2), mode='bilinear', align_corners=False)
-            gt2 = F.interpolate(self.gt, scale_factor=1/(scale), mode='bilinear', align_corners=False)
-            gt3 = F.interpolate(self.gt, scale_factor=1/5, mode='bilinear', align_corners=False)
-            l_pix_0 = self.cri_pix_multiscale(self.output[1], gt0)
-            l_pix_1 = self.cri_pix_multiscale(self.output[2], gt1)
-            l_pix_2 = self.cri_pix_multiscale(self.output[3], gt2)
-            l_pix_3 = self.cri_pix_multiscale(self.output[4], gt3)
-            l_pix_multi = l_pix_0 + l_pix_1 + l_pix_2 + l_pix_3
-            l_total += l_pix_multi
-            loss_dict['l_pix_multi'] = l_pix_multi
 
+        # --------------------
+        # 2) Optional multi-scale auxiliary loss
+        # --------------------
+        if self.cri_pix_multiscale and len(self.output) > 1:
+            gt_levels = [
+                F.interpolate(self.gt, scale_factor=1 / (scale * 4), mode='bilinear', align_corners=False),
+                F.interpolate(self.gt, scale_factor=1 / (scale * 2), mode='bilinear', align_corners=False),
+                F.interpolate(self.gt, scale_factor=1 / scale, mode='bilinear', align_corners=False),
+                F.interpolate(self.gt, scale_factor=1 / 5, mode='bilinear', align_corners=False)
+            ]
+            multiscale_loss = 0
+            for i, gt_i in enumerate(gt_levels, start=1):
+                if i < len(self.output):
+                    multiscale_loss += self.cri_pix_multiscale(self.output[i], gt_i)
+            l_total += multiscale_loss
+            loss_dict['l_pix_multi'] = multiscale_loss
+
+        # --------------------
+        # Backpropagation
+        # --------------------
         self.scaler.scale(l_total).backward()
         self.scaler.step(self.optimizer_g)
         self.scaler.update()
 
         self.log_dict = self.reduce_loss_dict(loss_dict)
 
+        # Exponential Moving Average (optional)
         if self.ema_decay > 0:
             self.model_ema(decay=self.ema_decay)
